@@ -1,0 +1,119 @@
+stages:
+  - tag
+  - build
+
+variables:
+  GIT_STRATEGY: "clone"
+  VERSION: "1.4.2"
+ 
+create_tag:
+  stage: tag
+  image: alpine:3.19
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "trigger"'
+      when: always
+    - when: never
+  before_script:
+    - apk add --no-cache git
+    - git config user.name "GitLab CI"
+    - git config user.email "ci-runner@gitlab.com"
+  script:
+    - SHORT_SHA=$(git rev-parse --short HEAD)
+    - SAFE_BRANCH=$(echo "$CI_COMMIT_REF_NAME" | tr '/' '-')
+    - NEW_TAG="v${VERSION}-${SAFE_BRANCH}-${SHORT_SHA}"
+    - echo "Creating Git tag:$NEW_TAG" 
+    - |
+      if git ls-remote --tags origin | grep -q "refs/tags/$NEW_TAG"; then
+        echo "Tag $NEW_TAG already exists. Skipping tag creation." 
+      else
+        git tag -a "$NEW_TAG" -m "Automated tag for branch $CI_COMMIT_REF_NAME ($CI_COMMIT_SHA)"
+        git remote set-url origin "https://$USER_NAME:$GITLAB_TOKEN@${CI_PROJECT_URL}"
+        git push origin "$NEW_TAG"
+      fi
+
+    - echo "$NEW_TAG" > new_tag.txt  
+  artifacts:
+    paths:
+      - new_tag.txt  
+
+build_image_via_api:
+  stage: build
+  image: docker:26.1.3
+  services:
+    - docker:26.1.3-dind
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "trigger"'
+      when: always
+    - when: never
+  dependencies:
+    - create_tag  
+  before_script:
+    - apk add --no-cache jq curl git
+    - echo "Logging into GitLab registry..."
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - NEW_TAG=$(cat new_tag.txt)
+    - echo "Using new tag:$NEW_TAG"
+    - |
+      if [ -n "$BUILD_COMMIT" ]; then
+        echo "Checking out specific commit $BUILD_COMMIT"
+        git fetch origin $BUILD_COMMIT
+        git checkout $BUILD_COMMIT
+      else
+        echo "Using default commit:$CI_COMMIT_SHA"  
+      fi
+    - echo "Generating study-apps.json with CI_JOB_TOKEN"
+    - |
+      cat > study-apps.json <<EOF
+      [
+        {
+          "url": "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/neon2501537/frappe-study-app.git",
+          "branch": "test-api-trigger"
+        }
+      ]
+      EOF
+    - cat study-apps.json
+  script:
+    - echo "Building Docker image for project:$CI_PROJECT_PATH"
+    - echo "Version:$VERSION"
+    - export REGISTRY_URL="$CI_REGISTRY"
+    - export IMAGE_PATH="$REGISTRY_URL/$CI_PROJECT_PATH:$NEW_TAG"
+    - export APPS_JSON_BASE64="$(cat study-apps.json | base64 | tr -d '\n')"
+    - docker buildx create --use
+    - docker buildx inspect --bootstrap
+    - docker buildx bake --file docker-bake.hcl --set "*.args.CI_JOB_TOKEN=$CI_JOB_TOKEN" --set "*.args.APPS_JSON_BASE64=$APPS_JSON_BASE64" --set "*.args.VERSION=$VERSION" --set "*.tags=$IMAGE_PATH" --push
+    - echo "Image pushed to $IMAGE_PATH"
+    - IMAGE_DIGEST=$(docker buildx imagetools inspect "$IMAGE_PATH" --format '{{json .Manifest.Digest}}' | tr -d '"')
+    - IMAGE_TIMESTAMP=$(date -u +"%d %B %Y at %H:%M:%S GMT+0")
+    - echo "$IMAGE_PATH" > image_path.txt
+    - echo "$IMAGE_DIGEST" > image_digest.txt
+    - echo "$IMAGE_TIMESTAMP" > image_timestamp.txt
+  after_script:  
+    - echo "Sending callback to notify pipeline result..."
+    - STATUS=$([[ "$CI_JOB_STATUS" == "success" ]] && echo "success" || echo "failed")
+    - FINAL_SHA=$(git rev-parse HEAD)
+    - IMAGE_PATH=$(cat image_path.txt)
+    - IMAGE_DIGEST=$(cat image_digest.txt)
+    - IMAGE_TIMESTAMP=$(cat image_timestamp.txt)
+    - |
+      cat > payload.json <<EOF
+      {
+        "pipeline_id": "$CI_PIPELINE_ID",
+        "project_id": { "id": $CI_PROJECT_ID },
+        "project": "$CI_PROJECT_PATH",
+        "status": "$STATUS",
+        "sha": "$FINAL_SHA",
+        "ref": "$CI_COMMIT_REF_NAME",
+        "version": "$VERSION",
+        "image_path": "$IMAGE_PATH",
+        "image_digest": "$IMAGE_DIGEST",
+        "image_timestamp": "$IMAGE_TIMESTAMP",
+        "docname": "$DOCNAME"
+      }
+      EOF
+    - cat payload.json  
+    - echo "our docname is $DOCNAME"
+    - |
+      curl -X POST "$FRAPPE_BASE_URL/api/method/edc_master_data.edc_master_data.doctype.et_80_build_configuration.et_80_build_configuration.insert_pipeline_response" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: token $FRAPPE_API_KEY:$FRAPPE_API_SECRET" \
+        -d "@payload.json" 
