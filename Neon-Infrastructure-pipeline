@@ -1,0 +1,45 @@
+stages:
+  - terraform-apply
+
+variables:
+  AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+  AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+  TF_VAR_container_registry_pat: $GITLAB_TOKEN
+  TF_VAR_container_registry_username: $GITLAB_TOKEN
+  TF_VAR_gitlab_username: $GITLAB_USERNAME
+  TF_VAR_gitlab_token: $GITLAB_TOKEN
+  REGISTRY_USER: $GITLAB_USERNAME
+  REGISTRY_PASSWORD: $GITLAB_TOKEN
+
+terraform-apply:
+  stage: terraform-apply
+  resource_group: terraform
+  script:
+    - apt update -y && apt install -y jq curl wget unzip git
+    - wget -q https://releases.hashicorp.com/terraform/1.7.4/terraform_1.7.4_linux_amd64.zip
+    - unzip terraform_1.7.4_linux_amd64.zip
+    - mv terraform /usr/local/bin/
+    - rm terraform_1.7.4_linux_amd64.zip
+    - terraform --version
+    - printf "%s" "$PRIVATE_KEY" > private_key.pem
+    - chmod 600 private_key.pem
+    - terraform init -input=false
+    - terraform workspace select "$SITE_NAME" || terraform workspace new "$SITE_NAME"
+    - terraform validate
+    - terraform plan -var "study_image_tag=${STUDY_IMAGE_TAG}" -var "site_name=${SITE_NAME}" -out=tfplan -var="private_key=$(cat private_key.pem)"
+    - terraform apply -auto-approve tfplan 
+    - SITE_HOSTNAME=$(terraform output -raw site_hostname)
+    - ADMIN_PASSWORD=$(terraform output -raw admin_password)
+    - EC2_IP=$(terraform output -raw ec2_public_ip)
+    - |
+      curl -X POST "$FRAPPE_BASE_URL/api/method/outmind.outmind.doctype.orchestrator_log.orchestrator_log.insert_orchestrator_response" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: token $FRAPPE_API_KEY:$FRAPPE_API_SECRET" \
+        -d "{
+              \"site_name\": \"${SITE_HOSTNAME}\",
+              \"admin_password\": \"${ADMIN_PASSWORD}\",
+              \"ec2_public_ip\": \"${EC2_IP}\",
+              \"docname\": \"${DOCNAME}\"
+            }"
+  only:
+    - triggers
