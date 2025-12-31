@@ -1,0 +1,116 @@
+stages:
+  - tag
+  - build
+
+variables:
+  GIT_STRATEGY: "clone"
+  VERSION: "2.4.1"
+
+create_tag:
+  stage: tag
+  image: alpine:3.19
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "trigger"'
+      when: always
+    - when: never
+  before_script:
+    - apk add --no-cache git
+    - git config user.name "GitLab CI"
+    - git config user.email "ci-runner@gitlab.com"
+  script:
+    - SHORT_SHA=$(git rev-parse --short HEAD)
+    - SAFE_BRANCH=$(echo "$CI_COMMIT_REF_NAME" | tr '/' '-')
+    - NEW_TAG="v${VERSION}-${SAFE_BRANCH}-${SHORT_SHA}"
+    - echo "Creating Git tag:$NEW_TAG"
+    - git fetch --tags
+    - |
+      if git ls-remote --tags origin | grep -q "refs/tags/$NEW_TAG"; then
+        echo "Tag $NEW_TAG already exists. Skipping tag creation."
+      else
+        echo "Tag does not exist. Creating and pushing new tag..."
+        git tag -a "$NEW_TAG" -m "Automated tag for branch $CI_COMMIT_REF_NAME ($CI_COMMIT_SHA)"
+        git remote set-url origin "https://$USER_NAME:$GITLAB_TOKEN@${CI_PROJECT_URL}"
+        git push origin "$NEW_TAG"
+      fi
+    - echo "$NEW_TAG" > new_tag.txt
+  artifacts:
+    paths:
+      - new_tag.txt
+
+build:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "trigger"'
+      when: always
+    - when: never
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  dependencies:
+    - create_tag
+  before_script:
+    - apk add --no-cache curl git openssl jq
+    - echo "Logging into GitLab registry..."
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin registry.gitlab.com
+    - NEW_TAG=$(cat new_tag.txt)
+    - echo "Using tag:$NEW_TAG"
+    - export CI_COMMIT_TAG="$NEW_TAG"
+  script:
+    - echo "Building Docker image..."
+    - STUDY_NAME=${CI_COMMIT_TAG%-v*}
+    - NEXTAUTH_SECRET=$(openssl rand -base64 32)
+    - echo "NEXTAUTH_SECRET=$NEXTAUTH_SECRET" >> .env
+    - echo "TENANT_URL=https://$STUDY_NAME.dev.cliniexperts.net"
+    - echo "TENANT_URL=https://$STUDY_NAME.dev.cliniexperts.net" >> .env
+    - echo "NEXTAUTH_PATH=https://$STUDY_NAME-t.dev.cliniexperts.net" >> .env
+    - echo "NEXTAUTH_URL=https://$STUDY_NAME-t.dev.cliniexperts.net/" >> .env
+    - echo "NEXT_PUBLIC_TENANT_URL=https://$STUDY_NAME.dev.cliniexperts.net" >> .env
+    - docker build -t registry.gitlab.com/neon2501537/${IMAGE_NAME}:$CI_COMMIT_TAG -t registry.gitlab.com/neon2501537/${IMAGE_NAME}:${STUDY_NAME}-latest .
+    - docker push registry.gitlab.com/neon2501537/${IMAGE_NAME}:${STUDY_NAME}-latest
+    - docker push registry.gitlab.com/neon2501537/${IMAGE_NAME}:$CI_COMMIT_TAG
+    - IMAGE_PATH="registry.gitlab.com/neon2501537/${IMAGE_NAME}:$CI_COMMIT_TAG"
+    - echo "$IMAGE_PATH" > image_path.txt
+    - IMAGE_DIGEST=$(docker buildx imagetools inspect "$IMAGE_PATH" --format '{{json .Manifest.Digest}}' | tr -d '"')
+    - echo "$IMAGE_DIGEST" > image_digest.txt
+    - IMAGE_TIMESTAMP=$(date -u +"%d %B %Y at %H:%M:%S GMT+0")
+    - echo "$IMAGE_TIMESTAMP" > image_timestamp.txt
+    - echo "Fetching compressed image size from GitLab Registry..."
+    - BLOB_SIZE=$(curl -sI -u "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" "$CI_REGISTRY/v2/$CI_PROJECT_PATH/blobs/$IMAGE_DIGEST" | grep -i Content-Length | awk '{print $2}' | tr -d '\r')
+    - IMAGE_SIZE=$(echo "scale=2; $BLOB_SIZE/1024/1024" | bc) 
+    - echo "Image Size (MiB):$IMAGE_SIZE"
+    - echo "$IMAGE_SIZE" > image_size.txt
+  after_script:
+    - echo "Sending callback to Frappe backend..."
+    - STATUS=$([[ "$CI_JOB_STATUS" == "success" ]] && echo "success" || echo "failed")
+    - FINAL_SHA=$(git rev-parse HEAD || echo "$CI_COMMIT_SHA")
+    - IMAGE_PATH=$(cat image_path.txt 2>/dev/null || echo "")
+    - IMAGE_DIGEST=$(cat image_digest.txt 2>/dev/null || echo "")
+    - IMAGE_TIMESTAMP=$(cat image_timestamp.txt 2>/dev/null || echo "")
+    - IMAGE_SIZE=$(cat image_size.txt 2>/dev/null || echo "")
+    - |
+      cat > payload.json <<EOF
+      {
+        "pipeline_id": "$CI_PIPELINE_ID",
+        "project_id": { "id": $CI_PROJECT_ID },
+        "project": "$CI_PROJECT_PATH",
+        "status": "$STATUS",
+        "sha": "$FINAL_SHA",
+        "ref": "$CI_COMMIT_REF_NAME",
+        "version": "$VERSION",
+        "image_path": "$IMAGE_PATH",
+        "image_digest": "$IMAGE_DIGEST",
+        "image_timestamp": "$IMAGE_TIMESTAMP",
+        "image_size": "$IMAGE_SIZE",
+        "docname": "$DOCNAME"
+      }
+      EOF
+    - echo "Payload to send:"
+    - cat payload.json
+    - |
+      curl -X POST "$FRAPPE_BASE_URL/api/method/edc_master_data.edc_master_data.doctype.et_80_build_configuration.et_80_build_configuration.insert_pipeline_response" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: token $FRAPPE_API_KEY:$FRAPPE_API_SECRET" \
+        -d "@payload.json" || echo "Callback failed (non-fatal)"
